@@ -170,95 +170,144 @@ reboot behavior, provisioning selection, CLI checks, and the
 `machine_container_type` schema support LXD-specific semantics. DPU children
 need an explicit child or provisioning kind and an audit of these consumers.
 
-## Proposed controller-side DPU reconciliation
+## Current proposal: preparation before `StartInstance`
 
-The current direction keeps the ordinary `StartInstance` contract singular and
-introduces a controller-side DPU provisioner or reconciler backed by an optional
-provider capability. It runs on the controller because MAAS relationships are
-visible through the model's cloud credential; it does not need to run on the
-parent machine.
+The current proposal introduces a durable provider preparation phase before a
+machine becomes eligible for the existing `StartInstance` path. The working
+name for this phase and its user-visible status is `recon`, preceding `pending`.
+The name and whether this should be a machine status at all remain undecided.
 
-Calling this component only a broker understates its responsibility. A broker
-adapts provider operations, while the worker must watch desired and observed
-state, retry idempotently, honour cancellation, register instance information,
-and coordinate removal.
+The phase is processed by a controller worker through a new provider method.
+Providers without preparation work return a no-op result, after which the
+machine advances immediately to `pending`. For the managed MAAS parent case,
+preparation performs the allocation-only part of today's `StartInstance`, asks
+MAAS for every DPU belonging to the allocated parent, and records the resulting
+topology before any of those machines boot.
 
-### DPU cardinality and durable intent
+This ordering solves the cloud-init identity problem. Every DPU gets a Juju
+machine entity, machine ID, password, nonce, and agent configuration before its
+operating system is deployed. The later `StartInstance` invocation can then
+carry child-specific cloud-init rather than attempting to enrol all children
+with the parent's user-data.
 
-An early proposal was to pre-create one DPU child together with the parent, as
-`add-machine lxd` does. This is insufficient because the number of DPUs attached
-to the selected parent may not be known until MAAS allocates the parent. A
-parent may have zero, one, or several attached DPUs.
+Calling the controller component only a broker understates its responsibility.
+It must watch durable preparation intent, retry provider operations
+idempotently, persist discovered topology, advance provisioning phases, honour
+cancellation, and coordinate cleanup. It does not need to run on the parent
+machine because it uses the model's MAAS credential from the controller.
 
-Juju should instead persist parent-scoped DPU management intent before
-provisioning. Individual child machines are materialised after discovery. The
-reconciler should correlate children by stable MAAS DPU system ID, not by the
-assigned `3/dpu/N` ordinal, so retries and controller restarts cannot create
-duplicates.
+### Proposed managed-parent sequence
 
-A managed provisioning sequence is therefore:
+1. Juju creates a parent machine in the tentative `recon` phase and persists
+   that its visible DPUs are to be managed.
+2. The preparation worker asks the MAAS provider to prepare the machine. MAAS
+   runs the allocation portion of `StartInstance`, but does not deploy the
+   allocated parent.
+3. MAAS is queried for the zero-to-many DPUs associated with that allocated
+   parent. Preparation must return stable MAAS identities for the parent and
+   every visible DPU.
+4. A Juju domain operation records the parent's prepared reservation and
+   transactionally upserts one child machine for each DPU. Children are
+   correlated by stable MAAS DPU identity, not by an assigned `3/dpu/N`
+   ordinal.
+5. The parent and child machines advance to `pending` once their machine
+   entities and prepared reservations are durable.
+6. The compute provisioner handles each machine separately. It creates that
+   machine's `InstanceConfig` and invokes `StartInstance` with an explicit
+   prepared reservation, conceptually similar to a resolved `--to` placement.
+7. MAAS adopts the already allocated resource, skips allocation, and deploys it
+   with that machine's cloud-init. Successful deployment records the ordinary
+   final instance ID and hardware/network information.
+8. Application placement reconciliation deploys declared DPU workloads onto
+   the discovered child machines.
 
-1. Juju creates the parent machine and persists that its visible DPUs are to be
-   discovered and managed.
-2. The normal compute provisioner calls `StartInstance` for the parent and
-   records the parent's MAAS system ID.
-3. The controller-side DPU reconciler observes the parent instance ID and asks
-   the MAAS provider for all DPUs associated with it.
-4. The reconciler transactionally upserts one child machine for each stable DPU
-   identity, producing names such as `3/dpu/0` and `3/dpu/1`.
-5. Each DPU child receives its own provisioning information and is deployed or
-   enrolled independently.
-6. Application placement reconciliation deploys declared DPU workloads onto
-   the discovered children.
+The sequence retains the singular `StartInstance` request and response: there
+is one call, boot payload, result, and Juju machine per parent or DPU. The new
+plurality exists in the earlier preparation result and in the domain operation
+that materialises related machines.
 
 ### Provider capability
 
-Because the cardinality is not necessarily one, the discovery operation should
-be plural. An illustrative provider capability is:
+An illustrative provider-neutral capability is:
 
 ```go
-type DPUProvider interface {
-    DPUsForParent(
+type InstancePreparer interface {
+    PrepareInstance(
         context.Context,
-        instance.Id,
-    ) ([]DPUInstance, error)
+        PrepareInstanceParams,
+    ) (*PrepareInstanceResult, error)
+}
+
+type PrepareInstanceResult struct {
+    Primary PreparedInstance
+    Related []RelatedPreparedInstance
 }
 ```
 
-The concrete result type is undecided. At minimum, each discovered DPU needs a
-stable provider identity and enough lifecycle and capability information to
-decide whether it can be enrolled.
+`PrepareInstanceParams` must carry a per-Juju-machine idempotency identity and
+the selection information needed for allocation, but not final cloud-init.
+Each prepared result needs at least a stable provider resource identity, a
+reservation or adoption token, a relationship role, and enough observed
+hardware information to create and provision the corresponding Juju machine.
 
-Discovery alone is sufficient only if a DPU has already received valid Juju
-machine-agent configuration. Otherwise Juju needs a second operation that
-accepts child-specific provisioning data. For example:
+Providers that do not implement the optional capability can be treated as
+having no preparation work. This may be preferable to adding explicit no-op
+implementations to every provider. Whether the interface should remain generic
+or be MAAS/DPU-specific depends on whether a second provider use case emerges.
 
-```go
-type DPUProvisioner interface {
-    StartDPUForParent(
-        context.Context,
-        instance.Id,
-        instance.Id,
-        environs.StartInstanceParams,
-    ) (*environs.StartInstanceResult, error)
-}
-```
+For MAAS, the underlying API requirement remains plural: after allocating a
+parent, return all DPUs associated with that machine. The later MAAS
+`StartInstance` path also needs an explicit prepared-resource input so it can
+adopt and deploy an allocated machine without issuing another allocate request.
 
-Alternatively, `DPUsForParent` can return associated but undeployed MAAS machine
-identities and the provider can use the existing MAAS deploy operation for each
-DPU. The preferred boundary depends on what MAAS means by bringing up a DPU as
-part of parent deployment.
+### Prepared reservation is not a final instance ID
 
-The interfaces above are deliberately DPU-specific while requirements remain
-provider-specific. They can be generalised to related compute resources later
-if a second concrete use case establishes the right abstraction.
+The proposal says to associate MAAS IDs with the Juju machines during
+preparation, but this cannot use the existing final instance-ID field without a
+semantic change. The current compute provisioner treats a machine with an
+instance ID as already started and does not call `StartInstance`. The current
+schema likewise describes that ID as unset until the instance has actually
+been created.
+
+Juju therefore needs to distinguish two facts:
+
+- **prepared reservation**: MAAS has allocated or resolved a resource for this
+  Juju machine, but `StartInstance` must still deploy it; and
+- **instance ID**: deployment has been accepted and the normal provisioner must
+  not start another instance.
+
+A separate prepared-reservation entity is preferable to overloading
+`machine_placement`. Placement records the user's original directive, while a
+reservation records a provider-resolved resource and its lifecycle. The
+prepared identity may equal the eventual MAAS system ID, but its state-machine
+meaning is different.
+
+Current MAAS placement by `system-id` is also not sufficient by itself. The
+MAAS `StartInstance` implementation still calls allocate after resolving that
+placement, whereas a prepared machine is already allocated and may no longer be
+eligible for allocation. `StartInstanceParams` therefore needs an explicit
+prepared reservation or adoption token, not merely a reconstructed placement
+string.
+
+### Earlier post-start discovery alternative
+
+The previous proposal provisioned the parent normally, then queried MAAS for
+its DPUs and created child machines. That remains a possible inventory model,
+but is not sufficient when MAAS has already deployed the DPUs during the parent
+operation. A separately managed DPU requires its Juju identity and cloud-init
+before first boot.
+
+The preparation proposal moves discovery to after parent allocation but before
+parent or DPU deployment. This still accommodates unknown cardinality: a parent
+may have zero, one, or many DPUs, and child machines are materialised only after
+MAAS reports the actual set.
 
 ## Terraform and dynamic DPU placement
 
 Terraform cannot reliably enumerate DPU machine resources in one plan when the
-number and identities of DPUs are unknown until the parent is allocated.
-Terraform `for_each` keys derived from that discovery would be unknown during
-planning and commonly require a second apply.
+number and identities of DPUs are unknown until the parent is prepared during
+apply. Terraform `for_each` keys derived from that discovery would be unknown
+during planning and commonly require a second apply.
 
 Terraform can nevertheless declare an application placement policy that Juju
 owns and reconciles. Terraform tracks one stable policy rather than every
@@ -300,16 +349,20 @@ need explicit design.
 
 ### Direct DPU
 
-- Juju creates a normal top-level machine.
-- A DPU-specific resource selector is passed through normal `StartInstance`.
-- MAAS allocates and deploys one DPU.
+- Juju creates a normal top-level machine in the preparation phase.
+- A DPU-specific resource selector causes MAAS preparation to allocate one DPU
+  as the primary prepared resource, with no related children.
+- The machine advances to `pending`, and `StartInstance` adopts and deploys the
+  prepared DPU with its Juju machine-specific cloud-init.
 - Juju records one ordinary provider instance result.
-- No parent-child discovery worker is involved.
+- No parent-child materialisation is involved.
 
 ### Secure parent with hidden DPU
 
-- Juju creates only a top-level parent machine.
-- A parent capability constraint requires a host with a DPU.
+- Juju creates only a top-level parent machine in the preparation phase.
+- A parent capability constraint causes MAAS preparation to allocate a host
+  with a DPU, but Juju does not request or receive the hidden DPU identities.
+- The parent advances to `pending`, and `StartInstance` adopts and deploys it.
 - MAAS performs any hidden DPU preparation using its own privileges.
 - Juju records only the parent and does not probe for attached DPUs.
 - A permission failure from DPU discovery is therefore not part of this mode's
@@ -317,11 +370,15 @@ need explicit design.
 
 ### Managed parent with visible DPUs
 
-- Juju creates the parent and persists DPU management or placement intent.
-- Normal `StartInstance` provisions and records the parent.
-- The controller-side DPU reconciler discovers zero or more related DPUs.
-- Juju creates and independently enrols one child machine per stable DPU
-  identity.
+- Juju creates the parent in the preparation phase and persists DPU management
+  or placement intent.
+- MAAS preparation allocates the parent and returns zero or more related DPU
+  reservations.
+- Juju creates one child machine per stable DPU identity and durably associates
+  every parent and child with a prepared reservation.
+- The parent and children advance to `pending`; the compute provisioner invokes
+  `StartInstance` separately for each prepared resource and records each final
+  instance result.
 - Application placement policies fan out units across the resulting children.
 
 ## Desired MAAS API behavior
@@ -341,29 +398,59 @@ The operation should provide:
 - sufficient relationship metadata to prove that each DPU belongs to the
   requested parent.
 
+For the preparation design, the relationship response also needs to make clear
+whether each DPU is reserved for Juju, merely observable, or implicitly owned
+by the parent's reservation. Juju must be able to retry the operation and adopt
+the same resources after a controller failure.
+
 The existing allocation API also needs selectors for:
 
 - allocating a DPU directly; and
 - allocating a parent that has one or more DPUs.
 
-Depending on existing MAAS behavior, further API support may be necessary for
-per-DPU deployment with Juju user-data. MAAS and Juju must also agree on a
-single owner for release behavior: releasing a parent might release all attached
-DPUs, or Juju might release each DPU child explicitly, but both sides must not
-independently race the same ownership transition.
+The existing MAAS allocate and deploy operations may be sufficient for the two
+halves of preparation and start, but the Juju MAAS provider needs a supported
+way to deploy an already allocated machine without allocating it again. Further
+MAAS API support may be necessary if attached DPUs cannot use the ordinary
+per-machine deploy operation with child-specific user-data.
+
+MAAS and Juju must also agree on a single owner for release behavior: releasing
+a parent might release all attached DPUs, or Juju might release each DPU child
+explicitly, but both sides must not independently race the same ownership
+transition.
 
 ## Reconciliation and lifecycle requirements
 
 Any implementation must define the following before code is added:
 
+- **Phase semantics**: Preparation is distinct from machine-agent `pending`
+  status, and all readers agree which phase makes a machine eligible for
+  `StartInstance`.
+- **Reservation semantics**: Prepared provider identity is stored separately
+  from the final instance ID and from the user's original placement directive.
+- **Provider idempotency**: Retrying preparation for one Juju machine returns
+  the same allocation and related DPU set rather than reserving another parent.
+- **Side-effect recovery**: If MAAS allocation succeeds and the controller
+  fails before state is committed, a retry can find, adopt, or release the
+  orphaned reservation. The current model-wide MAAS agent name is not a unique
+  per-machine idempotency key.
 - **Stable correlation**: The tuple of model, parent provider ID, and DPU
   provider ID maps to at most one Juju child.
-- **Restart safety**: A worker restart between discovery and state registration
-  does not leak or duplicate DPU children.
+- **Atomic domain update**: Parent reservation, child machine creation, child
+  reservations, relationships, and phase transitions become durable together.
+- **Restart safety**: A worker restart at any boundary between allocation,
+  discovery, state registration, and deployment does not leak resources,
+  duplicate children, or boot with the wrong cloud-init.
 - **Typed absence**: No DPU, DPU not yet ready, DPU hidden by authorization, and
   provider failure have distinct outcomes.
-- **Partial failure**: One failed DPU does not lose the identities or status of
-  its siblings, and the parent result remains recorded.
+- **Partial failure**: One failed DPU preparation or deployment does not lose
+  the identities or status of its siblings, and the parent has a defined
+  ability to proceed or roll back.
+- **Deployment ordering**: MAAS and Juju agree whether parent and DPU deployment
+  may run independently, must be ordered, or requires a compound coordination
+  operation.
+- **Prepared cleanup**: Cancellation and removal release resources that were
+  allocated but never deployed, including partially recorded related DPUs.
 - **Parent removal**: Parent lifecycle changes drive child draining and cleanup
   in a deterministic order.
 - **DPU removal**: A disappeared or failed DPU has defined unit evacuation,
@@ -372,8 +459,14 @@ Any implementation must define the following before code is added:
   matching DPU set grows or shrinks.
 - **Credential changes**: Loss or restoration of DPU visibility does not cause
   accidental deletion or duplicate adoption.
+- **Provisioner selection**: DPU children are watched and started despite the
+  current compute watcher excluding slash-qualified machine names as
+  containers.
+- **Hardware data**: Preparation and `StartInstance` have a single, defined
+  owner for storing parent and DPU hardware characteristics without losing
+  information or reporting it twice.
 - **Migration**: Model export, import, and controller migration preserve DPU
-  intent, child identity, and parent relationships.
+  intent, prepared reservations, child identity, and parent relationships.
 
 ## Open questions
 
@@ -381,19 +474,32 @@ Any implementation must define the following before code is added:
    system ID and the normal deploy, status, and release operations?
 2. When MAAS "brings up" a DPU with its parent, is the DPU merely powered or
    commissioned, or is an operating system already deployed?
-3. Can Juju deploy child-specific user-data after MAAS establishes the
+3. Does allocating a parent make its DPU identities and reservation ownership
+   immediately available, before either resource is deployed?
+4. Can Juju deploy child-specific user-data after MAAS establishes the
    relationship, or must a compound request provide all boot payloads up front?
-4. Can a parent have multiple DPUs, and can the set change after allocation?
-5. Which MAAS operation owns reservation and release of an attached DPU?
-6. Does direct DPU allocation detach or otherwise reserve the DPU independently
+5. Can an already allocated parent or DPU be adopted and deployed by stable ID
+   without another allocate call?
+6. What provider-side idempotency key can correlate an allocation with one Juju
+   machine across controller failure and retry?
+7. Can a parent have multiple DPUs, and can the set change between preparation,
+   deployment, and later operation?
+8. Which MAAS operation owns reservation and release of an attached DPU?
+9. Does direct DPU allocation detach or otherwise reserve the DPU independently
    of its parent?
-7. What child-kind representation should replace the current assumption that
-   every slash-qualified machine is an LXD container?
-8. Does an application placement policy continuously target all matching DPUs,
-   or select a fixed set during initial deployment?
-9. What should Terraform report when a policy has zero matching DPUs or some DPU
-   units fail to converge?
-10. Which constraints or placement directives distinguish direct, secure
+10. Should `recon` be a user-visible machine status, or a separate provisioning
+    phase that leaves agent status semantics unchanged?
+11. Should provider preparation be an optional generic capability, or an
+    explicit method implemented as a no-op by every provider?
+12. What child-kind representation should replace the current assumption that
+    every slash-qualified machine is an LXD container?
+13. What deployment ordering or failure policy applies when the parent starts
+    successfully but one or more DPUs do not?
+14. Does an application placement policy continuously target all matching DPUs,
+    or select a fixed set during initial deployment?
+15. What should Terraform report when a policy has zero matching DPUs or some
+    DPU units fail to converge?
+16. Which constraints or placement directives distinguish direct, secure
     parent-only, and managed parent-plus-DPU intent?
 
 ## Current source locations
@@ -414,7 +520,12 @@ where the note was written:
 - `internal/provider/maas/volumes.go`: conversion of allocation constraint
   matches into Juju volumes and attachments;
 - `internal/provisionertask/provisioner_task.go`: singular provider invocation
-  and instance-info registration;
+  and instance-info registration, including the current rule that an existing
+  instance ID prevents `StartInstance`;
+- `domain/schema/model/sql/0017-machine-cloud-instance.sql`: current final
+  instance-ID storage;
+- `domain/schema/model/sql/0018-machine.sql`: provider placement and generic
+  parent relationships;
 - `domain/machine/state/placement.go`: transactional parent and LXD child
   creation;
 - `internal/container/broker/lxd-broker.go`: independent child configuration and
