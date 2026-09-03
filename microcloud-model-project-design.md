@@ -8,7 +8,7 @@ model on MicroCloud. It is not an accepted implementation design, and no
 implementation work is currently planned.
 
 The Juju source observations were verified on branch `4.0` at commit
-`4b0603428e` on 2026-08-28. They must be revalidated before implementation.
+`4b0603428e` on 2026-09-03. They must be revalidated before implementation.
 
 ## Requirement
 
@@ -178,6 +178,63 @@ When Juju generates the client certificate, it caches and reuses it. Reusing
 one certificate fingerprint is unsuitable for independently restricted model
 identities: each automatically managed model credential must have a distinct
 certificate and independently revocable LXD trust entry.
+
+### Credential finalization and project selection
+
+An LXD certificate's project restriction is an authorization allow-list. It
+does not select a current project for API requests. The LXD API treats a
+project-scoped request without an explicit `project` parameter as a request for
+the `default` project. `UseProject` configures the client to add that parameter;
+it is therefore required when using a credential confined to a non-default
+project. A restricted credential can establish a connection and perform some
+project-independent operations, but project-scoped operations against
+`default` are denied if `default` is not in its allowed project list.
+
+This exposes a coupling in current remote credential finalization:
+
+1. Juju redeems the trust token and obtains the LXD server certificate.
+2. It reconnects through `ServerFactory.RemoteServer` without setting
+   `CloudSpec.Project`.
+3. `RemoteServer` calls `bootstrapRemoteServer`, which validates the server by
+   reading the `default` profile and potentially ensuring default storage.
+4. Since no project was selected, those operations target the LXD `default`
+   project and fail for a certificate restricted only to the intended model
+   project.
+
+The project need not become a credential attribute to fix this. Credential
+finalization should be project-neutral and should establish only that:
+
+- the trust token can register the generated client certificate;
+- the pinned server certificate is valid for the endpoint; and
+- the resulting client certificate can authenticate to the server.
+
+The server factory should separate connecting to a remote LXD server from
+opening and initializing a Juju environment. Credential finalization should use
+a connection-only path that performs no profile, storage, network, or instance
+operations. Environment construction should continue to take the project from
+model configuration, call `UseProject`, and only then validate the project and
+initialize its resources.
+
+The LXD pending trust-token operation already records whether the certificate
+is restricted and which projects it permits. LXD applies that policy when the
+token is redeemed, so Juju does not need to know the project merely to finalize
+the credential.
+
+Making `project` a required credential field would duplicate model
+configuration and create conflicting sources of truth. It would also model an
+LXD certificate incorrectly because one certificate can authorize more than one
+project while each client request targets exactly one project. If the product
+later enforces a strict one-credential-per-model-project policy, the credential
+could carry an optional project binding or hint. Model creation could use that
+to default the model setting and reject mismatches, but the authoritative
+runtime selection should remain system-owned model configuration applied with
+`UseProject`.
+
+Without a new controller-level tenancy or super-credential, this change fixes
+restricted-token onboarding but does not automate project creation. An external
+administrator or broker must pre-create the project and issue the restricted
+token. Juju then finalizes the credential independently and creates the model
+with the matching explicit project configuration.
 
 ## Project construction for MicroCloud
 
