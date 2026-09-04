@@ -262,6 +262,60 @@ Bootstrap should seed the same endpoint model that the steady-state worker
 maintains, avoiding the current transition from Service addresses to pod
 addresses when `apiaddresssetter` first runs.
 
+### Preserve Kubernetes Service FQDNs
+
+The shared endpoint model must preserve DNS names reported by Kubernetes, not
+only IP addresses. This is required for controller Services whose externally
+usable address is a load balancer hostname rather than an ingress IP.
+
+In 3.6, a Service hostname is represented as an ordinary `SpaceAddress` with:
+
+- the FQDN as its value;
+- address type `hostname`;
+- `public` scope for an external name or load balancer ingress;
+- `provider` origin.
+
+The address is stored in the controller `CloudService` alongside Service IP
+addresses. The legacy migration description preserves its value, type, scope
+and origin. The 3.6 CAAS client-address path then includes it in the best-public
+address tier and returns it as `fqdn:api-port`.
+
+Main is not currently faithful to this representation after decoding the
+legacy description. `domain/network/modelmigration/import_cloudservice.go`
+copies the address metadata into `ImportK8sServiceAddress`, but
+`domain/network/service/migration.go` converts every such address into an
+`ImportIPAddress`. Its placeholder-subnet map contains entries only for IPv4
+and IPv6. A `hostname` address consequently fails conversion with:
+
+```text
+no subnet UUID found for address type "hostname"
+```
+
+This is a conversion failure, not merely an omitted endpoint. The live
+`UpdateK8sService` path in `domain/application/state/application.go` has the
+same IP-only assumption, so a fresh Service update containing a load balancer
+hostname also fails when it cannot find a subnet for address type `hostname`.
+
+Handle Kubernetes Service addresses according to their type:
+
+- persist IPv4 and IPv6 addresses through the existing `ip_address` and
+  placeholder-subnet path;
+- persist a fully qualified Service name in `fqdn_address`, retaining its
+  `local-cloud` or `public` network scope, and link it to the
+  `k8s_service.net_node_uuid` through `net_node_fqdn_address`;
+- reconcile and remove both IP and FQDN rows when the provider-reported
+  Service addresses change;
+- make shared Service endpoint queries include both address representations;
+- project a public Service FQDN into the any-controller client endpoint set
+  with the API port, where it participates in the same best-public selection
+  as a public ingress IP.
+
+Do not conflate these provider-reported Service FQDNs with either of the
+internal names introduced for other purposes. The normal controller Service
+FQDN synthesized by 3.6 for agents was not stored in `CloudService`, and the
+per-pod headless-Service FQDN on main identifies one controller for Dqlite.
+Neither is a migrated public client endpoint.
+
 ### Apply 3.6-compatible scope selection
 
 Provide two distinct selection operations:
@@ -317,6 +371,13 @@ Add policy tests covering at least:
 - delayed LB allocation updates the client endpoint set;
 - user login, migration and cross-controller results contain no pod IP when a
   Service endpoint is available;
+- legacy import preserves a public Service hostname as a scoped
+  `fqdn_address` linked to the Service net node;
+- bootstrap and subsequent Service updates accept a load balancer hostname
+  and replace or remove stale Service FQDNs;
+- a public Service FQDN is returned to clients in the best-public tier, while
+  an internal Service FQDN is restricted to the appropriate agent endpoint
+  selection;
 - per-controller internal lookup never returns a shared Service as though it
   identified one controller;
 - CAAS `ControllerDetails` does not advertise an unreachable controller-node
