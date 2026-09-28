@@ -1,0 +1,87 @@
+name: juju-pr-review
+description: "Use when reviewing PRs from the juju/juju Go repo."
+version: 1.0.0
+license: MIT
+
+
+Juju PR Review Methodology
+
+Review methodology for pull requests against juju/juju (Go project, Canonical's orchestration engine). Apply in two phases: the item-level checklist first, then the deeper analysis heuristics. Write reviews in a directive tone — specific, actionable instructions a developer can act on directly.
+
+Phase 1 — Item-Level Checklist
+
+CORRECTNESS: Does the code do what it claims? Edge cases handled (nil, empty, concurrent)? Error paths handled?
+SECURITY: No hardcoded secrets? Input validation? No injection or traversal? Auth checks where needed?
+CODE QUALITY: Clear naming? No unnecessary complexity? DRY? Focused functions?
+TESTING: New code paths tested? Happy and error cases covered? Tests readable?
+PERFORMANCE: No N+1 queries? No unnecessary loops? No blocking in concurrent paths?
+DOCUMENTATION: Public APIs documented? Non-obvious logic commented?
+
+Phase 2 — Deeper Analysis Heuristics
+
+These heuristics catch systemic issues the item-level checklist misses. Apply each one deliberately before writing the review.
+
+DUPLICATE CODE ACROSS BRANCHES: When a PR changes code that exists in parallel IAAS/CAAS or similar branch-specific copies (e.g. separate manifold declarations, worker configs, or service wiring for different deployment modes), check whether the changes made the copies identical. If two previously-different code blocks are now the same after the PR's changes, flag that they should be consolidated into the shared/common declaration area rather than maintained as duplicates. In juju, this pattern repeats across machine, safemode, and dbrepl manifold files.
+
+PR SCOPE AND BREAKUP ASSESSMENT: Assess the breadth of functionality selected for inclusion in the PR. Smaller PRs are easier to review and merge. A small change that touches multiple layers (worker, API/facade, service, state) is acceptable if it is genuinely small and simple. However, a PR that changes many files across multiple layers and bundles multiple distinct features should receive advice on breaking it up. When flagging this, suggest concrete split points. Generated mock files, test files, and mechanical renames do not count toward scope. When a breakup is recommended, it should appear as the first item in Suggestions.
+
+DATA FLOW TRACING: For each new feature or behavior change, trace the complete path data takes from where it is produced to where it is consumed. Every transformation, serialization, or handoff between packages is a potential corruption or loss site. Ask: what shapes does the code produce? Does every consumer handle every shape? Does anything get silently dropped, stringified, or coerced at a boundary? When a function name implies an action (repair, save, persist), trace whether the data actually reaches its destination.
+
+ARCHITECTURAL NECESSITY CHECK: For every new interface, adapter, wrapper, or indirection layer the PR introduces, ask: what would happen if this did not exist? Could the methods live directly on the consuming type? If the adapter is a pure field-for-field translation with no business logic, it is likely unnecessary indirection. Also check for late-injection patterns (SetX methods called after construction) that create windows where the service silently returns default/empty values.
+
+NECESSARY CODE CHECK: For each method, branch, and fallback in the diff: is this code necessary? Could the method be inlined at its single call site because it is trivial (1-3 lines)? Could a branch be removed because its precondition can never occur? Could a fallback be eliminated because the primary path always succeeds? When an error branch's precondition cannot occur (e.g. it is not on a retry path, or the input is already validated upstream), flag it as dead code.
+
+FIELD USAGE TRACING: When a struct or parameter is passed through layers (e.g. provider -> bootstrap -> database), trace which fields are actually consumed at each layer. If a field is passed but not consumed by the receiving layer, flag it as unnecessary surface area — the field should be taken off the shared type and added only to the layer that needs it. This prevents API leakage where a substrate-specific field is carried through interfaces that other substrates don't use.
+
+REACHABILITY CHECK: For error branches, fallbacks, and defensive checks: trace whether the precondition for the branch can actually occur. If the input is validated upstream, the path is not retried, or the state makes the condition impossible, flag the branch as dead code that should be removed or documented as a deliberate guard.
+
+QUERY/FILTER EDGE-CASE ENUMERATION: For every SQL query, WHERE clause, or filter in the diff, enumerate who or what is included and who or what is excluded. Then trace what happens to each excluded category downstream. Specifically check: disabled/deleted users, external/JWT/OIDC users, nil/empty/zero values, entities created by a different lifecycle path, and rows that depend on a JOIN that might not match. Also check what happens to existing data during type migrations.
+
+TEST COVERAGE AGAINST ACTUAL BEHAVIOR: Do not just check "are there tests?" — enumerate all distinct input shapes the code produces and all distinct output shapes it emits, then check whether each one has test coverage. A test that only covers the shape the PR author was fixing gives false confidence. Look for: output formats produced by one code path but consumed by another, error paths mentioned in comments but not tested, and round-trip tests that only exercise one direction or one shape.
+
+CROSS-DATABASE TRANSACTION WINDOW ANALYSIS: When a PR implements a multi-step state machine that spans multiple databases, check whether the steps run in a single transaction or sequentially. For each step boundary, ask: what state is the system in if the process dies here? Are there windows where one database reflects a committed change but the other does not?
+
+DIRECTIVE TONE: Reviews should suggest specific, actionable code changes rather than raising abstract questions. Instead of "consider documenting X" or "worth confirming Y", say "X should be Y" or "move X to Z" or "remove this branch because Z". Reviews should read as instructions a developer can act on directly. When suggesting a change, be concrete about what to move, remove, or rename — include file paths and function names.
+
+ABSTRACTION COHERENCE: Require abstractions to expose a coherent contract that every implementation fulfils without callers knowing its concrete type. Reject implementation-specific call sequencing (callers must not need to invoke methods in a particular order or know which concrete type they hold), unsupported-method stubs (methods that exist on the interface but panic/return errors for some implementations), and forwarding wrappers with no meaningful responsibility (a wrapper that only delegates field-for-field without adding validation, state, or coordination). Do not introduce or extend faulty abstractions; correct the affected boundary first. Verify that modifications preserve existing abstraction contracts, including completion, error handling, retry behaviour, and lifecycle ordering.
+
+SCHEMA PATCH EVOLUTION: When a PR edits an existing database schema patch file (NNNN-*.sql) in place, first check the release status of the version that shipped the file. In-place upgrade compatibility is only required for RCs and normal releases — betas carry no obligation to upgrade in-place, so until RC the base patch files may be modified directly (a new incremental patch file is NOT required). Across minors, upgrades are always via migration: the model data goes into a database built with the new schema, so in-place patch edits do not affect cross-minor upgrades at all. Only flag an in-place patch edit as a problem when the file shipped in an RC or final release whose models must upgrade in place within the same minor; in that case require a new patch file (e.g. DROP INDEX IF EXISTS ...; CREATE ...) instead of the in-place edit. Never raise this as a Critical for files that shipped only in beta versions.
+
+NAMING CONSISTENCY FOR STATE METHODS: Naming should be consistent, particularly across domain/x/state sub-packages for methods performing the same kind of action. In state packages, "Get" and "List" are not different operations — they both just select things (GetThingsOfTypeA vs ListThingsOfTypeB wrongly implies a semantic distinction that does not exist). Do not let one state method use "Get" where a sibling doing the same kind of action uses "List"; pick one verb for the selecting-action family and use it consistently (matching the prevailing convention in that package when extending it). Additionally, prefer "Delete" over "Clear" for persistence-layer removal actions — DeleteThings is clearer than ClearThings for a state/persistence layer action. Flag new or renamed methods that introduce verb inconsistencies with their sibling state methods, with the concrete suggested name.
+
+INTERNAL JARGON IN LOGGING AND NAMING: The terms IAAS and CAAS are internal juju jargon and are opaque to end users. Review all new log messages, error messages, and user-facing strings in the diff for these terms — no new logging should be added that uses IAAS or CAAS. In the case of CAAS specifically, no new naming should adopt it: prefer "K8s" instead (e.g. a new CAASDeployer type should be named K8sDeployer). Flag any new identifier, log line, or message string introduced by the PR that uses these terms, with the concrete rename.
+
+Architecture and Alternative Approaches
+
+When reviewing, actively consider whether there are better architectural or solution approaches than what the PR implements. Look for Go idioms, juju-specific conventions, simpler alternatives, missed reuse opportunities, and better concurrency/data modeling patterns. Be constructive.
+
+Review Output Format
+
+Reviews are posted as COMMENT events (never APPROVE or REQUEST_CHANGES), with this body structure:
+
+Code Review Summary
+
+Verdict: Comment (N issues, M suggestions)
+
+Critical
+1. file:line — description
+
+Warnings
+1. file:line — description
+
+Suggestions
+1. PR scope: description of breakup opportunity with concrete split points (if applicable)
+2. file:line — description
+
+Architecture and Alternative Approaches
+- description of a better approach
+
+Looks Good
+- positive observations
+
+
+Reviewed by lee-van-cleef[bot]
+
+The body MUST use numbered lists (1., 2., 3.) for Critical, Warnings, and Suggestions sections so authors can refer to specific points by number. Bullet points are fine for Architecture and Looks Good sections. If the PR scope assessment identified a breakup opportunity, include it as the first item in the Suggestions section.
+
+Inline comments pitfall: GitHub requires inline comment line numbers to fall within the changed lines of a diff hunk (the "+" lines). When in doubt, use an empty comments array and consolidate all feedback in the body with file:function references.
