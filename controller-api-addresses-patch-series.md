@@ -1,7 +1,10 @@
 # Controller API addresses: patch series
 
-Updated 2026-10-01 from the local source and projection branches. The original
-plan used Juju `4.1` at `c9f6752833858c81acc5dd40bd3832e08374c213`
+Updated 2026-10-01 against the merged prerequisites and proposed
+[PR #23458](https://github.com/juju/juju/pull/23458), head `b0198f0175`.
+PR statuses were verified through GitHub and against the current checkout.
+The original plan used Juju `4.1` at
+`c9f6752833858c81acc5dd40bd3832e08374c213`
 (`4.1-beta3`) and the [agreed specification](https://github.com/juju/juju-agent-specs/blob/2121f49d2a3a2f53fa9534832236017c55e21b05/2610/JUJU-8694/controller-api-addresses-4.1-plan.md).
 The implementation now proceeds as separate source, projection and consumer
 changes against newer `4.1` heads. Patch numbers below retain their existing
@@ -32,36 +35,41 @@ use peer addresses. No controller-model network service is passed through
 
 ## Implementation status and landing order
 
-The local `4.1` branch includes patch 1's [PR #23364](https://github.com/juju/juju/pull/23364)
-at `2a07b4e4ea` and patch 2's [PR #23416](https://github.com/juju/juju/pull/23416)
-at `03708aaf00`. These are local Git observations, not a fresh remote PR review.
+The prerequisites have landed on `4.1`: patch 1 in
+[PR #23364](https://github.com/juju/juju/pull/23364) at `2a07b4e4ea`, patch 2 in
+[PR #23416](https://github.com/juju/juju/pull/23416) at `03708aaf00`, and all of
+patch 8 in [PR #23464](https://github.com/juju/juju/pull/23464) at `56ca513293`.
+Patch 3 is proposed in [PR #23458](https://github.com/juju/juju/pull/23458),
+rebased onto those changes.
 
 | Patch | Work | Status / dependency |
 | --- | --- | --- |
-| 1 | Preserve Kubernetes Service IP and DNS sources | Included in local `4.1` |
-| 2 | Reconcile the controller API Service lifecycle | Included in local `4.1` |
-| 3 | Add controller network queries and watcher | Committed through `4dff9a3222` on `4.1-controller-addr-targets`; publisher integration remains in 9 |
-| 8a | Add the three projection tables, triggers and export support | Committed as `211262fdb6` on the separate projection branch |
-| 8b | Make the existing setter write agent/client projections | Committed as `bc2938254d`; keeps the existing source watcher |
-| 8c | Move current consumers to audience-specific reads/watches | Committed through `1e8c658920` on `4.1-new-controller-address-projections`; follow-ups are recorded in section 8 |
-| 9 | Integrate the new source services and publish all three audiences | Next publisher change after 1–3 and 8 land |
+| 1 | Preserve Kubernetes Service IP and DNS sources | Landed in #23364 |
+| 2 | Reconcile the controller API Service lifecycle | Landed in #23416 |
+| 8a | Add the three projection tables, triggers and export support | Landed in #23464 |
+| 8b | Make the existing setter write agent/client projections | Landed in #23464; retains the existing source watcher |
+| 8c | Move current consumers to audience-specific reads/watches | Landed in #23464; remaining policy work is recorded in section 8 |
+| 3 | Add client, agent and peer network selections and the source watcher | Proposed in #23458, head `b0198f0175`; does not publish projections |
+| 9 | Integrate the new source services and publish all three audiences | Next implementation step, landing after #23458 |
 | 4 | Switch API remote callers to the peer projection | After 9 supplies peer addresses |
 | 5 | Complete diagnostic targeting and Kubernetes HA restrictions | Client projection from 8, final publication policy from 9 |
 | 6 | Complete reverse-SSH targeting | Client projection from 8, final publication policy from 9 |
 | 7 | Reconcile certificate identities from typed sources | Sources from 1–3; interim client-projection watcher is already in 8c |
 
-The current checkout is `4.1-controller-addr-targets` at `4dff9a3222`.
-Projection work is committed on its separate branch and is not part of this
-checkout. The untracked `internal/worker/controllernetwork/` directory is an
-earlier source-composition prototype, not a recruited worker or a completed
-publisher integration. The earlier object-store network accessor/factory
-extension has been backed out.
+The current checkout is `4.1-controller-addr-targets` at `b0198f0175`, matching
+the proposed service PR. All three prerequisite merge commits are ancestors of
+this head. Source-file links in section 3 refer to this checkout until it lands.
+The untracked `internal/worker/controllernetwork/` directory is an earlier
+source-composition prototype, not a recruited worker or a completed publisher
+integration. The earlier object-store network accessor/factory extension has
+been backed out.
 
 The sequence is intentionally incremental: add tables, change writes, change
 readers, then integrate the new sources and finally switch the remote caller.
 Intermediate writer/reader continuity and dual-writing the legacy table are
 not requirements. There is no longer a single coordinated activation patch
-for all readers. Reconcile the two branches when their prerequisites land.
+for all readers. The projection changes are already included in the service
+branch; no separate projection-branch reconciliation remains.
 
 ## 1. Preserve Kubernetes Service IP and DNS address sources
 
@@ -140,34 +148,59 @@ of patch 2 has not run.
 
 ## 3. Add controller network queries and watches for the publisher
 
-Implemented on `4.1-controller-addr-targets` through `4dff9a3222`:
+Proposed in [PR #23458](https://github.com/juju/juju/pull/23458), on
+`4.1-controller-addr-targets` through `b0198f0175`:
 
 - `GetControllerUnitNetwork` returns `ControllerAPIAddresses` directly.
   `ControllerUnitNetwork` was removed; model type comes from a separate query.
-- The existing network `Service` exposes `GetControllerPeerAddresses` and
-  `GetControllerTargetAddresses`. The public getters use address-specific
-  names for their data. `WatchableService` exposes `WatchControllerNetwork`.
+- The existing network `Service` exposes `GetControllerClientAddresses`,
+  `GetControllerAgentAddresses` and `GetControllerPeerAddresses`.
+  `GetControllerTargetAddresses` has been replaced by client selection.
+  `WatchableService` exposes `WatchControllerNetwork`.
+- Client and agent methods accept controller-unit membership and return
+  `ControllerAddressSelection`: addresses keyed by unit in `ByUnit`, plus
+  independent shared endpoints in `Shared`. Each group is ordered by
+  preference. Machine selections retain unit identity; Kubernetes discovery
+  uses shared Service addresses, excluding pod/headless addresses.
+- Client selection prefers public addresses with cloud-local fallback and is
+  independent of management-space configuration. Agent selection applies the
+  management space to machine controllers, with fallback when that space has
+  no eligible addresses. Kubernetes agents prefer cloud-local Service
+  addresses with public fallback and ignore management-space configuration.
+- `GetControllerServiceAddresses` reads the controller application's Service
+  IP/DNS sources independently of its units. Shared discovery works with empty
+  membership and survives removal of `controller/0`. Missing Service sources
+  produce an empty selection; failed reads return errors, not partial results.
 - State queries read the controller unit's IP/DNS sources and validate its
   controller-application association. Alive and Dying targets remain eligible;
   Dead, missing and unrelated targets are rejected.
-- Peer selection applies IAAS management-space selection with fallback when
-  that space has no eligible addresses. Kubernetes peer selection preserves
-  pod IP/DNS identities and their original scopes.
-- External node-target selection is independent of management-space policy.
-  Kubernetes returns `NotSupported` for this particular operation. This does
-  not prevent ordinary external client access through a Service. The target
-  source query does not imply a fourth projection table.
-- Model watcher namespaces cover unit identity/lifecycle, address/FQDN links,
-  devices, subnets and spaces, including network-node reassociation. Additional
-  changelog triggers cover mutable device and space inputs.
+- Peer selection remains per controller unit. It applies management-space
+  selection with fallback to machine controllers and preserves Kubernetes pod
+  IP/DNS identities and their original scopes. Kubernetes ignores a management space;
+  the peer test checks identical results and forbids a space lookup.
+- Missing model rows consistently return `modelerrors.NotFound` from unit,
+  shared-Service and model-type queries. The state regression tests assert the
+  sentinel. Management-space restriction now lives in the selection helper.
+- Model watcher namespaces cover unit identity/lifecycle, `k8s_service`
+  associations, address/FQDN links, devices, subnets and spaces, including
+  network-node reassociation. Additional changelog triggers cover mutable
+  device and space inputs. Service creation, reassociation, deletion and
+  changes during watcher startup have regression coverage.
 
-Publisher integration is deferred to patch 9. It must combine this model
-watcher with controller membership/configuration and normal Service sources,
-waiting for every required initial event before querying. Resolve the actual
-controller-model UUID when constructing its network service. A UUID must never
-be compared with `ControllerModelName`. The restricted controller services
-already use the controller database; their existing namespace selection does
-not require a controller-model network extension.
+This PR supplies source selection and watching; it does not populate the
+projection tables or switch the existing setter. The landed setter still calls
+`GetControllerAPIAddresses` and the existing controller-node `SetAPIAddresses`.
+The new controller-domain publication contract and worker integration belong
+to patch 9.
+
+The publisher must combine `WatchControllerNetwork` with controller membership
+and configuration watchers, waiting for every required initial event before
+querying. The model watcher already covers normal Service associations and
+addresses. Resolve the actual controller-model UUID when constructing its
+network service. A UUID must never be compared with `ControllerModelName`.
+The restricted controller services already use the controller database; their
+existing namespace selection does not require a controller-model network
+extension.
 
 Reuse or move useful code from the untracked `controllernetwork` prototype into
 the publisher's source coordination as appropriate. Do not recruit a separate
@@ -183,10 +216,16 @@ management-space cases, association/lifecycle validation, network reassociation,
 empty initial events, changes during subscription/initial reads, deterministic
 shutdown, and access to the actual controller model database.
 
-Earlier source work passed race tests and bounded source/watcher stress tests.
-The historical prototype/factory tests do not validate the revised publisher
-wiring; repeat the relevant checks when integrating patch 9. Full lint and live
-controller validation remain outstanding.
+Validation during the service changes: network service, state and watcher
+package tests passed with `-race`. Eight bounded controller-network watcher
+stress runs passed. The focused controller-network state suite passed after
+the missing-model error fix, and the full service suite passed after adding the
+Kubernetes/management-space test, both with `-race`. `apiaddresssetter` and
+`cmd/jujuagentd` dependents compiled with `-race`; mocks regenerate identically,
+and `gci`/whitespace checks passed. `STATIC_ANALYSIS=1 make pre-check` reached
+linting but stopped because `golangci-lint` was missing. These checks do not
+validate the future publisher wiring or live Kubernetes behaviour; patch 9
+must supply that integration coverage.
 
 ## 4. Resolve API remote callers from the published peer projection
 
@@ -301,10 +340,11 @@ tests from the fixed-name peer TLS tests in patch 4.
 
 ## 8. Add projections and migrate existing publication/consumers
 
-This work was split into three independently reviewable steps on
-`4.1-new-controller-address-projections`, based on `5371cf31f3`.
+All three steps landed in
+[PR #23464](https://github.com/juju/juju/pull/23464), merge `56ca513293`,
+including its review fixes, trigger regeneration and deferred SQL row close.
 
-### 8a. Projection schema -- implemented
+### 8a. Projection schema -- landed
 
 The three tables defined above each store `uuid`, `controller_id`, `address`
 (host or IP with API port), `scope` and `priority`. Lower priority values are
@@ -318,7 +358,7 @@ notifications are keyed by controller ID. Metadata changes notify, while
 unchanged updates do not. `controller_api_address` remains in the schema and
 export representation pending cleanup.
 
-### 8b. Existing setter writes the new tables -- implemented
+### 8b. Existing setter writes the new tables -- landed
 
 - `apiaddresssetter` retains its existing source watcher and calls the existing
   controller-node publication service. It does not yet use patch 3's source
@@ -335,10 +375,10 @@ export representation pending cleanup.
   Shared rows are supported by the schema, but the existing setter still
   publishes controller-associated rows. An empty input map remains a no-op;
   this is not yet the full-snapshot reconciliation needed in patch 9.
-- Controller removal now clears agent/client rows as well as legacy rows.
-  Peer-row cleanup must be included before peer publication begins.
+- Controller removal clears agent/client/peer rows as well as legacy rows in
+  the same transaction, preserving other controllers and shared endpoints.
 
-### 8c. Existing consumers read/watch the new tables -- implemented
+### 8c. Existing consumers read/watch the new tables -- landed
 
 - Agent and client state readers select their respective tables. They retain
   UUID/scope/priority, use stable ordering within groups and include nullable
@@ -397,23 +437,65 @@ not their future combination with patch 3 or live Kubernetes behaviour.
 `STATIC_ANALYSIS=1 make pre-check` passed the preceding checks and stopped at
 missing `golangci-lint`; optional licence/shell-format tools were also absent.
 
+### PR #23464 review fixes -- landed
+
+The merged projection PR includes these review changes:
+
+- Replaced formatted SQL with complete literal statements selected by a fixed
+  table-keyed map, as requested in the [SQL review](https://github.com/juju/juju/pull/23464#discussion_r4156271428).
+  The shared reconciliation algorithm does not interpolate identifiers.
+- Completed peer-address deletion with controller removal. Regression coverage
+  includes peer rows, repeated deletion, other controllers and shared endpoints.
+- Aligned the proxy facade's watcher variable and the cross-controller getter
+  comment with their agent/client audiences.
+- Clarified and tested the certificate boundary: state returns IP:port, while the
+  public service strips the port and returns bare IPv4/IPv6 to `certupdater`.
+  The bot's port-bearing SAN warning overlooks that conversion, so no second
+  split is needed in the worker. IPv6 coverage accompanies the IPv4 cases.
+  Typed DNS/SAN source selection remains patch 7.
+- Regenerated the controller triggers and deferred the SQL row close flagged
+  by `sqlclosecheck`.
+
+The peer table, triggers and export support landed together, as agreed for the
+three-table change. Peer publication remains in patch 9 and its reader switch
+in patch 4.
+
+Defer shared-endpoint writes to patch 9, which first publishes them. The current
+setter only accepts controller-associated rows. Its composite upsert target
+`(controller_id, address)` does not handle NULL identity: shared writes must
+use the partial unique index on `(address) WHERE controller_id IS NULL` and
+reconcile shared rows explicitly. Cover unchanged republishing, stable UUIDs,
+metadata changes, removal and preservation of controller-associated rows.
+Do not extend the existing per-controller writer by merely passing an empty
+controller ID.
+
 ## 9. Integrate source services and publish all three projections
 
-This is now the next publisher change after the source and projection work
-lands. Ordinary readers are already on the new tables. Integrate the existing
-`apiaddresssetter` with the new source/watcher and publication services, then
-switch the remote caller separately in patch 4.
+This is the next implementation step, landing after PR #23458. Source
+persistence, projection schema and ordinary reader migration have already
+landed. Integrate the existing `apiaddresssetter` with patch 3's source APIs
+and add the controller-domain publication contract, then switch the remote
+caller separately in patch 4.
 
 - Recruit source coordination under `apiaddresssetter`, retaining its
-  primary-controller ownership. Combine controller membership/configuration,
-  `WatchControllerNetwork`, normal Service/address association changes and
-  relevant policy inputs. Wait for every required initial event before reads.
+  primary-controller ownership. Replace its per-unit `WatchUnitAddresses`
+  trackers with `WatchControllerNetwork`, which includes Service/address
+  associations. Combine this with controller membership/configuration watchers
+  and wait for every required initial event before reads.
   Resolve the actual controller-model UUID for model services; projection
   consumers continue to require only controller-database services.
-- Build explicit client, agent and peer address sets through domain services,
-  replacing the transient `IsAgent` split. Write the related projections
-  atomically. Reads preserve the selected policy/order and adapt only to their
-  wire or transport shape.
+- Map controller membership to unit names and call `GetControllerClientAddresses`
+  and `GetControllerAgentAddresses` with that membership. Translate `ByUnit`
+  back to controller IDs and publish `Shared` with NULL controller identity.
+  Read shared discovery even when membership is empty. Query
+  `GetControllerPeerAddresses` for each member and retain its node identity.
+- Replace `SetAPIAddresses`' combined candidates/management-space input and
+  transient `IsAgent` split with explicit client, agent and peer sets. Network
+  services own selection; the setter adds the API port and coordinates the
+  controller-model and controller databases. Controller-node services validate
+  and atomically reconcile the three projections, including shared rows and
+  empty snapshots. Preserve the selected order in stored priorities; readers
+  adapt only to their wire or transport shape.
 - Kubernetes clients get the preferred external Service tier with private
   Service fallback as appropriate. Agents get internal Service endpoints with
   external fallback. Ordinary discovery excludes pod/headless endpoints.
