@@ -5,8 +5,327 @@ resizing existing storage. The initial assessment is that application storage
 directives remain useful as allocation defaults, but the 3.6 implementation does
 not provide the guarantees needed for resizing existing storage safely.
 
-Status: initial findings, asynchronous operation approach, worker coordination
-and proposed provider contracts, recorded on 2026-11-10.
+Status: working prototype and cloud resize infrastructure plan, updated on
+2026-11-13. Workload preparation remains an explicitly invoked charm action;
+new hooks and uniter coordination are out of scope. The selected workflow is `application-storage` followed by
+`juju resize-storage <unit>`; see the command decision below.
+
+## Prototype location and current additions
+
+The prototype is on
+[4.1-ephemeral-storage-resize-prototype](https://github.com/manadart/juju/tree/4.1-ephemeral-storage-resize-prototype).
+It is a throw-away proof of concept, with no new automated tests requested.
+
+The implementation through `0745bd5c422` provides:
+
+- Durable resize intent, one pending request per storage instance, retained
+  completed/failed results and a stable request UUID.
+- State, service and client API methods for submission and result lookup.
+  `resize-storage --wait` waits for the recorded outcome;
+  `show-storage-resize <request-id>` retrieves it later.
+- Machine-authorised execution APIs, persisted executor/attachment identity,
+  lifecycle revalidation and atomic reporting of measured capacities.
+- Execution in the existing machine storage provisioner, serialized with its
+  attachment/removal operations. Loop backing files grow in place, the device
+  capacity is refreshed, and whole-device managed ext4 filesystems can grow.
+- Cancellation, repeatable growth stages and retries after ambiguous reporting
+  failures. Unsupported providers and layouts produce explicit results.
+
+The execution additions are split into state (`ce7bd98ede0`), service
+(`f887bc902a7`), API (`de57eec40b4`) and worker (`0745bd5c422`) commits.
+Existing state/service/schema and worker tests passed with the race detector;
+24 bounded worker stress runs reported no failures. Scratch database and
+backing-file checks passed, with device commands simulated in the latter.
+No live device or cloud resize was validated. Full lint was unavailable because
+`golangci-lint` was missing; plain vet also found an existing unkeyed test literal.
+
+## Directive-driven unit resize increment
+
+The command workflow now uses `application-storage <app> <name>=<size>`
+followed by `resize-storage <unit> [--wait]`. Submission stages or reuses the
+existing per-instance requests and reports already satisfied instances. The
+capacity target comes from the current application directive. Existing provider
+and machine execution stages are unchanged. See the command decision below for
+atomic staging, conflict handling and allocation ordering.
+
+The state and service changes are in `9c15120885d` and `5c741408cda`. Version 23
+of the Application facade identifies allocation-only directive updates; Storage
+version 10 adds unit submission. Earlier storage request APIs remain available
+for compatibility. The CLI requires those versions for the new workflow and
+supports size-only updates, preserving the pool and count through API encoding
+and persistence. Pool, count and compound directives are rejected. After a
+successful update, the command reads back and displays the affected directives
+in the same format as a query, including their new sizes and existing pool/count.
+
+Existing state, service, client API, facade and command suites pass with the race
+detector. Forty bounded stress runs of the existing storage command suite pass.
+A disposable SQLite model check exercised the new state and service paths:
+size-only updates preserve pool/count, create no requests, reject stale writes
+and allocations, stage multiple instances, reuse matching pending requests,
+reject conflicting batches, detect attachment changes and skip sufficient
+observed capacity. Raw block no-op detection requires both backend and machine
+device capacity, so partial backend growth still stages attachment work. The check caught and verified a SQLair projection correction
+in `e981db49466`. No new repository tests were added; existing mocks and the
+command-list fixture were updated. Static checks pass through schema and import
+validation, then stop because `golangci-lint` is not installed.
+
+The size-only refinement passes the existing core storage, application service,
+client API, facade and command suites with the race detector. Disposable command
+and SQLite checks confirm the update output matches a single-directive query,
+zero counts are preserved, pool/count edits are rejected, and failed updates
+produce no success output. No new repository tests were added.
+
+The live controller has not been upgraded and the new command workflow has not
+been run against it. Use the LXD verification commands below after installing
+the new agent.
+
+## Kubernetes allocation directive increment
+
+Size-only directive updates now support PVC-backed Kubernetes storage. Updating
+a directive changes allocation defaults; it does not resize existing claims.
+Before scaling, the application provisioner creates missing PVCs for the desired
+ordinals using current defaults or persisted unit allocation sizes. It uses the
+existing StatefulSet's claim-template names without replacing the StatefulSet.
+Existing claims retain their capacity and binding, including across retries and
+concurrent claim creation. Claim preparation must succeed before scaling.
+
+The state, service and worker/provider changes are in `86d5c181a35`,
+`b9073e29400` and `ada546b0044`. Kubernetes resizing of existing claims and
+rootfs/tmpfs directive updates remain outside this increment.
+
+Existing application state/service, storage provisioning state/service,
+Kubernetes provider, application provisioner and command suites pass with the
+race detector. Forty bounded application provisioner stress runs pass. No new
+repository tests were added; existing mock and call fixtures were updated.
+Disposable SQLite checks cover allocation snapshots, stale directive rejection,
+zero counts and unsupported storage types. A fake Kubernetes client check covers
+new ordinal sizes, persisted allocation sizes, unchanged existing claims and
+StatefulSet identity/templates, retry and create races, cancellation, zero-count
+defaults and claim-creation failures preventing scale changes. These checks do
+not establish live Kubernetes behaviour; no cluster has been upgraded or tested.
+Repository static checks pass through schema, import and context validation,
+then stop because `golangci-lint` is not installed. Licence and shell-format
+checks are skipped because `go-licenses` and `shfmt` are also unavailable.
+
+The CLI and controller agent build as `4.1-beta3.6` in `.bin`. Command help now
+identifies PVC-backed Kubernetes directive updates as supported and keeps
+existing-storage resizing restricted to machine models.
+
+## Integer resize request identifiers
+
+Each resize request now has an internal UUID and a model-scoped integer natural
+key. User commands display and accept the integer ID. A dedicated resize
+sequence allocates IDs in the same transaction that creates the requests;
+matching pending requests retain their original IDs when reused. A cumulative
+schema patch numbers existing requests while preserving their UUIDs, execution
+state and results.
+
+There is no parent operation or operation/task hierarchy. When
+`resize-storage <unit>` finds several storage instances below their current
+application targets, it stages independent requests atomically and returns an
+indented list of request IDs and storage names. Instance IDs disambiguate
+multiple instances of the same storage name. For example:
+
+```text
+Storage resize requests for postgresql/0:
+  - request 41 for pgdata (pgdata/0)
+  - request 42 for pgwal (pgwal/1)
+Check request status with 'juju show-storage-resize <id>'
+```
+
+Storage that already satisfies its target is reported separately without a
+request ID. YAML and JSON output retain the storage-to-request mapping and use
+the integer IDs. `--wait` follows each individual request, and
+`show-storage-resize 41` retrieves its retained result. Worker coordination and
+reporting continue to use UUIDs.
+
+Storage facade version 11 exposes integer-ID lookup; the client requires that
+version before submitting unit requests. Earlier UUID-based API methods remain
+available for older clients. Existing race-enabled schema, storage state/service,
+client API, facade and command suites pass. Disposable database and command
+checks cover cumulative upgrades, ID uniqueness and lookup, retry reuse,
+retained removal results, multiple instances of one storage name, formatted
+output, no-op submissions and partial failures. Forty bounded stress runs of
+the existing storage command suite pass. No new repository tests were added.
+No live controller has been upgraded or exercised with these changes.
+
+## Resize coordination with storage lifecycle
+
+The storage provisioner serialises resize reconciliation steps with creation,
+attachment, detachment and removal in its worker loop. For local ephemeral
+storage, this prevents the worker from unmounting a filesystem, detaching its
+loop device or deleting its backing file while a resize step is using it.
+Three cases still require explicit handling:
+
+1. **Lifecycle changes in controller state.** Storage or its attachments can
+   become dying while the worker is executing a step. Queued resize work must
+   revalidate lifecycle and resource identity before mutation. Completion
+   reports must reject stale state, even though the physical operations in the
+   worker are serialised.
+2. **Removal between resize stages.** Backend growth and device/filesystem
+   growth are separate steps. Removal can intervene between them. Further
+   resize steps must stop, and the request must retain a terminal result
+   reflecting the interruption and any growth already completed.
+3. **Asynchronous provider operations.** A provider resize may continue after
+   its method returns. Serialising method calls does not prevent a subsequent
+   removal from overlapping that remote operation. Future provider support
+   must coordinate conflicting operations for the actual lifetime of the
+   remote work, including across model/machine workers and worker restarts.
+   Reconciliation calls remain bounded; the worker loop must not wait for the
+   whole remote operation to finish.
+
+The intended guarantee is that removal prevents further resize steps from
+starting, any executing step settles before conflicting teardown proceeds,
+and the resize request receives a retained terminal result. Serial execution
+within one worker is the local foundation; durable coordination for remote
+operations remains a provider implementation requirement.
+
+## Cloud resize infrastructure increment
+
+The initial cloud increment added optional provider contracts and coordination
+without provider implementations. The LXD ZFS increment below implements the
+first provider. A source that does not implement its optional resize interface
+must produce an unsupported result during checks.
+Provider inspection errors remain retryable errors, not capability decisions.
+
+The request remains the user-facing operation. Generalise the single machine
+executor into a persisted backend stage and, when needed, an attachment stage:
+
+1. Resolve the provider resource, scope and relevant attachment identities.
+2. The backend worker checks eligibility and reports prerequisites and follow-up
+   requirements. The machine checks the device and managed filesystem.
+3. The service approves the target only after all required checks pass against
+   unchanged identities. Requested, approved and observed sizes stay distinct.
+4. The backend worker reconciles growth through idempotent ensure calls.
+   Acceptance is persisted as progress and does not complete the stage.
+5. After backend completion, the machine refreshes device capacity and performs
+   supported filesystem growth. The service completes the request only after
+   every required stage has reported sufficient observed capacity.
+
+State retains stage checks, requirements, progress and partial observations.
+Reports are conditional on the checked resource/attachment identity and stage;
+repeated reports are harmless and cannot regress a completed stage. Backend
+observations update volume capacity, device observations update block-device
+capacity, and filesystem observations update filesystem capacity. Partial growth
+survives failures. Removal retains the request result as before.
+
+Services coordinate the workflow through transactional state operations. Model
+workers use domain services directly; machine workers use their authorised API.
+The existing request/result commands remain usable. The model provisioner
+resolves the correct pool/source and invokes its optional `Resizer` contract.
+Volumes and provider-native filesystems share `ResizeRequest`; its `ProviderID`
+identifies the resource within the selected source. Resize source resolution
+must not use the creation-specific `Dynamic()` gate. Each reconciliation is
+bounded, with backoff for pending/blocked results rather than waiting for remote
+completion inside the provisioner loop.
+
+Machine execution is split into local backend growth and attachment expansion.
+Loop storage uses both stages on its machine; cloud storage uses a model backend
+stage followed by machine attachment work. Reuse device/filesystem validation
+and growth helpers. Start with online growth and one writable attachment;
+reject unsupported disruption, partition or shared-storage requirements before
+backend mutation. Do not infer workload readiness or invoke charm actions.
+
+The initial infrastructure keeps unsupported node transports/layouts explicit.
+Provider-native filesystems use the shared contract through their filesystem
+source. Unattached storage needing machine work remains pending; backend-only
+storage can complete after the required provider observations.
+Further provider implementations, offline coordination, multi-attachment
+execution and migration of active resize operations remain follow-up work.
+
+The implementation is split into documentation, provider contracts,
+state/schema, service coordination, API, and worker/executor commits.
+`storage_resize_plan` binds the resource snapshot and approved size;
+`storage_resize_stage` records backend and attachment checks and observations.
+The machine facade is `StorageResizer` version 2. Version 1 methods cannot bypass
+a staged plan. Machines can plan local loop work themselves, so cloud credential
+availability does not gate local resizing.
+
+The first cloud attachment executor handles whole SCSI devices with a stable
+`/dev/disk/by-id/` link and a kernel rescan interface, plus whole-device ext4.
+Other transports, partitioned layouts, shared attachments and disruption
+requirements remain explicit failures before backend growth. Provider-native
+filesystems use a backend-only stage. Providers other than LXD still fail their
+capability check because their sources do not implement the optional `Resizer`.
+
+The agent builds and existing race suites pass. Scratch service
+checks exercise approval, partial completion, separate volume/device observations
+and rejection of offline requirements. The loop backing-file smoke check still
+preserves contents with device commands simulated. These checks do not establish
+live SCSI, ext4 or cloud resize behaviour. The later LXD validation is below.
+
+## LXD ZFS provider increment
+
+The LXD filesystem source implements `Resizer` for custom filesystem
+volumes backed by ZFS datasets on standalone LXD servers. It grows the existing
+volume's `size` quota through the LXD API; no copy, replacement, detach, unmount,
+or machine-side filesystem growth is involved. This follows LXD's documented
+[ZFS quota semantics](https://canonical.com/lxd/docs/latest/reference/storage_zfs/#quotas).
+
+Checks are read-only. Both check and ensure inspect the actual pool driver,
+volume content type, model ownership, stable volume UUID and current quota.
+Other pool drivers, ZFS block mode, clustered servers, shared volumes and
+unlimited quotas are explicitly unsupported in this prototype. LXD inspection
+errors remain retryable. The implementation preserves the existing description
+and configuration, sends the current ETag with the quota update and honours the
+worker's bounded context for API calls and operation completion.
+
+Ensure re-reads the volume after LXD completes the update and verifies that its
+UUID is unchanged. It reports the provider's committed quota, not the requested
+value or a reservation of free space in the backing pool. A retry or smaller
+target is a no-op when the current quota already satisfies the target. No
+separate provider operation journal is required for this convergent quota
+update. A timeout or ambiguous response is retried by inspecting the same
+volume and target again. LXD 5.21 updates are synchronous; newer LXD versions
+may return an operation, whose acknowledgement uses the bounded context.
+
+The existing model-scoped flow is unchanged: record intent, check the provider,
+approve the plan, ensure the quota, persist observed filesystem size and finish
+the request. The controller agent must contain this implementation. Rebuilding
+only the CLI or the workload machine agent does not enable it.
+
+Live provider verification on LXD 5.21.9 used a disposable container and custom
+volume in the local `default` ZFS pool. The actual provider grew the mounted
+filesystem from 64 MiB to 128 MiB, verified with `df -B1`. A 1 MiB random file
+retained its SHA-256 checksum; the volume UUID, attachment and other settings
+were unchanged. Repeated ensure, a smaller target, cancellation and rejection of
+a `dir` pool were also checked. The disposable resources were removed. This
+verified the provider directly; the live Juju request/approval/reporting path
+still needs to be exercised with an updated controller agent. No new automated
+tests were added for this prototype.
+
+The existing LXD provider suite passes with the race detector, as do 40 bounded
+stress runs of its storage suite. Targeted vet passes with the composites check
+disabled; plain vet reports existing unkeyed test literals. Repository static
+checks reach Go lint, which remains unavailable because `golangci-lint` is not
+installed.
+
+To exercise that path after updating or re-bootstrapping the test controller,
+use a Juju pool that explicitly selects the existing ZFS pool:
+
+```sh
+export JUJU_DATA="$PWD/.juju-data"
+./.bin/juju create-storage-pool -m lxd:work resize-zfs lxd \
+  driver=zfs lxd-pool=default
+./.bin/juju deploy -m lxd:work ./testcharms/charms/dummy-storage-fs \
+  resize-zfs-test --base ubuntu@24.04 --storage data=resize-zfs,64M
+./.bin/juju storage -m lxd:work
+```
+
+Wait for storage attachment. Write a file to `/srv/data`, record its checksum
+and filesystem size, then update the default and apply it to the unit:
+
+```sh
+./.bin/juju application-storage -m lxd:work resize-zfs-test data=128M
+./.bin/juju resize-storage -m lxd:work resize-zfs-test/0 --wait
+./.bin/juju show-storage -m lxd:work data/<id>
+```
+
+Check the checksum and `df -B1 /srv/data` again on the unit, and use
+`lxc storage volume show default <provider-volume-name>` to confirm the same
+volume UUID and updated quota. Repeating the same target must complete without
+replacing storage. The pre-existing `lxd-zfs` Juju pool in this environment has
+a conflicting `zfs.pool_name`, so the commands above use a separate pool.
 
 The initial review baseline is branch `3.6` at
 `1cefd614fe63861595d5d43dacf1365de4819f4e`. Links in the existing behaviour and
@@ -188,8 +507,8 @@ from reversal of a storage expansion that has already started.
 
 ## Verified 4.1 baseline
 
-The standalone application storage directive update and Kubernetes claim-template
-update workflow from 3.6 is unavailable at the reviewed 4.1 revision. The
+At the original reviewed 4.1 baseline, the standalone application storage
+directive update and Kubernetes claim-template workflow from 3.6 were unavailable. The
 `application-storage` command is absent, and the retained
 [`UpdateApplicationStorage` API implementation](apiserver/facades/client/application/application.go#L2459)
 returns a not-implemented error. The storage-constraint watcher, provider
@@ -226,6 +545,92 @@ decisions.
 - Keep facades responsible for authentication and wire conversion, domain/state
   logic responsible for validation and durable intent, and workers responsible
   for provider reconciliation.
+- Keep workload preparation outside the resize operation. Charm authors can
+  provide actions that users explicitly invoke before resizing, with recovery
+  handled through the charm's documented procedure. New uniter coordination,
+  hooks and generic maintenance mode are outside the current resize scope.
+
+## Command decision
+
+`application-storage` displays the application's storage allocation defaults and
+updates their sizes. Only `<storage-name>=<size>` updates are supported; pool and
+count cannot be changed with this command. Updating validates and persists the
+supplied sizes; it does not submit resize requests or mutate existing storage.
+New units allocate storage using
+the current directive. Pool and count retain their current values, including a
+count of zero. Successful updates print the affected directives using the same
+output format as a query. For example:
+
+```text
+$ juju application-storage ceph-osd cache-devices=20GiB
+Storage        Pool  Size    Count
+cache-devices  loop  20 GiB  0
+```
+
+`juju resize-storage <unit> [--wait]` applies the current application capacity
+targets to that unit's existing storage instances. The command takes a unit,
+not a storage ID or an explicit size. Match instances to application directives
+by storage name, including every instance when a name has multiple allocations.
+Read the application directive rather than the unit's older directive copy.
+The existing `add-storage` command still defaults from the unit directive copy;
+changing that allocation path is outside this increment.
+Resizing never moves storage, creates additional instances or removes surplus
+instances.
+
+Stage a unit's requests atomically against a consistent snapshot of its live
+attachments and the current application directives. Generate request UUIDs in
+the service and revalidate the snapshot when committing. A changed directive,
+charm, lifecycle or attachment causes retry or an explicit conflict rather than
+partial submission. Targets are fixed once recorded, so later directive edits
+do not change work already underway. Reuse matching pending requests; conflicting
+pending targets reject the entire submission. Instances with sufficient observed
+capacity are reported as already satisfied, without shrinking or new requests.
+
+The result maps storage IDs to integer request IDs and their snapshotted target
+sizes.
+`--wait` waits for every staged/reused request and reports individual results,
+including partial execution failure. `show-storage-resize <request-id>` remains
+the way to inspect an individual request later. No parent operation is required.
+Request staging is atomic; physical expansion across several instances is not.
+
+For example, after any explicitly invoked charm preparation:
+
+```sh
+juju application-storage postgresql pgdata=20G
+juju resize-storage postgresql/0 --wait
+juju resize-storage postgresql/1 --wait
+juju resize-storage postgresql/2 --wait
+```
+
+This permits a user-controlled rolling resize and gives a later unit the larger
+allocation default. Unit creation must validate the directive snapshot in its
+insertion transaction, so an in-flight add-unit cannot commit an obsolete size.
+Concurrent charm refresh must likewise preserve or reject a changed directive.
+
+Kubernetes size-only directive updates are supported for PVC-backed storage.
+Before scaling, the application provisioner reads current allocation defaults
+and persisted unit allocations, then ensures claims for every desired ordinal.
+New ordinals use the current default; existing unit allocations retain their
+recorded sizes. Claims use the existing StatefulSet's template names, including
+legacy names, so its older capacity defaults do not determine new allocations.
+Initial deployment and recovery use the same preparation step before scaling.
+Claims are created with create-only semantics: existing or concurrently created
+claims are checked but never resized or replaced. A created claim fixes its size
+across retries and later directive changes. An add-unit transaction rejects a
+stale directive snapshot. No directive watcher or StatefulSet replacement is
+needed for capacity updates. Existing PVC reuse preserves its size and binding.
+
+Kubernetes rootfs/tmpfs (`emptyDir`) directive updates are excluded: their sizes
+are part of the shared pod template and need separate handling. The existing
+single-allocation-per-storage-name Kubernetes limitation is retained; multiple
+persisted allocations of the same name on a unit are rejected explicitly.
+
+Kubernetes resizing of existing storage remains follow-up work and resize
+submission still requires a machine model. A future Kubernetes resize executor
+will patch the individual bound PVC, preserve PVC/PV identity, and wait for
+Kubernetes controller and node expansion to finish.
+It will not require a Juju machine resize worker. Existing provider contracts,
+per-instance requests and execution stages remain the basis for both models.
 
 ## Asynchronous resize operation approach
 
@@ -236,9 +641,13 @@ query its progress and result later. Returning that identifier means the
 request has been recorded for checking; it does not mean provider checks have
 passed or storage has grown.
 
-The flow is:
+Where a workload needs preparation, the user first follows the charm's
+documented procedure and explicitly invokes its preparation action. The resize
+operation does not invoke that action or wait for a new uniter acknowledgement.
 
-1. The user issues a resize command. The API authenticates and authorises the
+The resize flow is:
+
+1. The user issues `juju resize-storage`. The API authenticates and authorises the
    request, and the domain service validates its structure and resolves the
    target storage from model state. These checks can return immediate errors.
 2. Persist an operation containing the requested size, stable storage identity
@@ -253,26 +662,27 @@ The flow is:
    transactionally approve the target for execution. Verify that the operation
    generation, resource identity, lifecycle and relevant state still match the
    checked request before allowing mutation.
-5. Where workload interruption is required, prepare the affected workloads and
-   record readiness before permitting disruptive storage work. Preparation is
-   a separate stage after the side-effect-free checks.
-6. Workers converge the approved target, recording progress through the backend,
+5. Workers converge the approved target, recording progress through the backend,
    attachment and filesystem stages that apply. Completion requires all stages
    needed for the storage instance; backend request acceptance is insufficient.
-   Restore workload access and perform any required charm recovery afterwards.
-7. The user obtains the result by operation identifier, either through a status
+   This includes restoring storage access where the operation changed it.
+6. The user obtains the result by operation identifier, either through a status
    query or by waiting. Rejection during checking and failure during execution
    are recorded with their phase and reason.
+
+The user handles any subsequent workload recovery through the charm's
+documented procedure, including a recovery action where provided. This is
+outside the resize operation's completion criteria.
 
 The operation's requested size remains distinct from the approved resize target
 until checks pass. Rejection during checking leaves the storage's desired size
 unchanged. An already-satisfied request can complete after the necessary
 observations without issuing a resize mutation.
 
-A conceptual lifecycle is `pending -> checking -> resizing -> completed`, with
-additional preparation and recovery stages when workload coordination is
-required, as described below. Rejection or failure is recorded against the
-phase where it occurred. Exact state names and retry policy remain open.
+A conceptual lifecycle is `pending -> checking -> resizing -> completed`.
+Workload preparation and recovery are outside that lifecycle. Rejection or
+failure is recorded against the phase where it occurred. Exact state names
+and retry policy remain open.
 Temporary problems, such as an unavailable machine, must be distinguishable
 from definitive rejection; the operation needs an explicit blocked or retrying
 policy for them.
@@ -286,12 +696,21 @@ conditions before acting and handle changes between checking and execution.
 If execution fails after some stages succeed, the result must retain those
 observations and completed stages; failure does not imply rollback of growth.
 
-## Worker and uniter coordination
+## Worker coordination and out-of-band workload preparation
 
-The uniter needs to participate when resizing requires workload coordination.
-Fully online growth may need no uniter involvement beyond any completion
-notification we choose to provide. The uniter owns interaction with the charm;
-storage workers own the physical storage changes.
+### Scope decision
+
+New uniter behaviour for resizing is explicitly out of scope. Introducing new
+hooks requires wider consultation with the charming ecosystem. Generic
+maintenance mode remains a separate proposal and is not a prerequisite for
+storage resizing.
+
+For now, preparation uses the existing charm action mechanism, following the
+pattern used for operations such as upgrades: the charm author supplies a
+preparation action and the user explicitly executes it outside the resize
+workflow. The uniter continues to execute ordinary actions through its existing
+machinery; resizing adds no preparation hooks, readiness acknowledgements,
+scheduling restrictions or completion notifications.
 
 The current uniter has no resize coordination. Its
 [storage resolver](internal/worker/uniter/storage/resolver.go#L173) ignores
@@ -306,11 +725,12 @@ charm or establish that the workload is ready for disruption.
 
 | Participant | Responsibility |
 | --- | --- |
-| Domain service and persisted operation | Record participants, requirements, phase and acknowledgements; enforce valid transitions and conflicting-operation rules. |
+| Domain service and persisted operation | Record storage identities, attachments, requirements, worker progress and results; enforce valid transitions and conflicting-operation rules. |
 | Model storage worker | Check and grow model-scoped storage, including requesting Kubernetes PVC expansion. |
 | Machine storage worker | Check local devices and filesystems; perform required device, partition, filesystem and mount operations. |
-| Uniter | Coordinate charm preparation and recovery when the workload must participate; deliver any resize notification. |
 | Kubernetes application provisioner | Coordinate any required pod disruption and conflicting scaling or application changes. |
+| Charm author | Supply and document any preparation action and workload recovery procedure, including how the prepared condition is maintained. |
+| User | Explicitly execute preparation for the affected workloads, submit and monitor the resize, then perform the documented workload recovery. |
 
 These responsibilities do not yet prescribe new worker types or select a
 coordinator implementation. Coordination should use durable operation state and
@@ -318,110 +738,99 @@ validated transitions. Watcher notifications prompt participants to re-read
 that state; receiving a notification does not establish another worker's
 readiness or completion.
 
-### Preparation and recovery
+### Preparation and recovery responsibilities
 
-For a resize requiring interruption, the conceptual execution sequence is:
+The charm's action may stop writes, flush data, transfer a workload role or stop
+a service. Its documented procedure must cover the affected consumers and keep
+the workload prepared for the required interval. Ordinary hooks and actions
+continue to run under existing uniter scheduling, so the charm must preserve
+its prepared condition when handling them and relevant restarts.
 
-`checking -> preparing workload -> resizing -> restoring workload -> completed`
+The resize operation does not discover preparation actions, execute them or
+interpret their results as a Juju-managed readiness guarantee. Users follow
+the charm's preparation procedure before requesting disruptive resizing.
+Storage workers still check and establish the physical prerequisites they
+control, such as an unmounted filesystem, and revalidate relevant conditions
+before mutation. An out-of-band action does not replace those checks.
 
-Preparation changes workload state and belongs after the side-effect-free
-checks. The charm may need to stop writes, flush data or stop a service. The
-uniter records readiness for the specific operation, generation and attachment.
-Storage workers can then establish physical prerequisites, such as an
-unmounted filesystem, and proceed with the required expansion stages. After
-storage access is restored, the uniter coordinates workload resumption.
+After resizing, the user follows the charm's recovery procedure once storage
+access is safe. This also applies after rejection or failure: preparation may
+already have changed the workload. The resize result must expose partial
+growth and outstanding storage problems so that recovery can take account of
+the actual outcome. Workload recovery is not performed or certified by the
+resize operation.
 
-The preparation contract needs the following guarantees:
-
-- Readiness remains true until released. A completed preparation hook is
-  insufficient if a later action or hook can restart the workload. Uniter
-  scheduling and the charm contract must preserve the prepared condition,
-  including across agent restarts. The set of operations permitted while
-  prepared remains a design decision.
-- All affected consumers are accounted for. Shared storage may require several
-  unit acknowledgements. New attachments or changed participants must invalidate
-  readiness or be prevented during the relevant phase. A stale acknowledgement
-  must not authorise work on a different attachment or operation generation.
-- Preparation has explicit charm support and readiness semantics. Existing
-  [hook execution treats a missing hook as success](internal/worker/uniter/operation/runhook.go#L157).
-  That behaviour cannot prove that an older charm has quiesced its workload.
-- Failure includes recovery obligations. If preparation succeeds but expansion
-  fails, the operation must retain the information needed to restore the
-  workload safely. Completed growth must remain recorded; a failed operation
-  does not imply that the original size or workload state has been restored.
-
-A dedicated resize coordination contract is needed if workload preparation is
-supported. Hook names, capability declarations and acknowledgement mechanisms
-remain open. Reusing `storage-detaching` would be incorrect: its
+Reusing `storage-detaching` for preparation would be incorrect: its
 [commit path](internal/worker/uniter/storage/attachments.go#L124) participates in
 removing the attachment. Temporary unmounting for growth must preserve the
 logical attachment and storage identity.
 
 ### Kubernetes coordination and the 3.6 findings
 
-For Kubernetes, the CSI driver and kubelet perform backend and node expansion;
-the uniter handles any charm coordination. See the documented
+For Kubernetes, the CSI driver and kubelet perform backend and node expansion.
+See the documented
 [CSI expansion responsibilities](https://kubernetes-csi.github.io/docs/volume-expansion.html).
-If the selected expansion path requires pod recreation, preparation must be
-persisted before terminating the pod, and the replacement agent must recover
-the operation and its remaining obligations. Storage identity and contents must
-survive; pod recreation is not a general solution for ephemeral storage.
+If the selected expansion path requires pod recreation, the charm's documented
+preparation must account for it, and storage workers must recover their durable
+progress after disruption. The prepared workload condition remains the charm's
+responsibility. Storage identity and contents must survive; pod recreation is
+not a general solution for ephemeral storage.
 
 The earlier findings constrain this coordination:
 
 | Finding | Required coordination property |
 | --- | --- |
-| F1 Replacement presented as resize | Keep the original storage identity through preparation, expansion and recovery; reject stale references to replaced resources. |
-| F2 Missing ordering barrier | Gate conflicting work on persisted conditions and acknowledgements. If defaults are also changed, retain an explicit ordering contract for fresh allocations. |
-| F3 Stale charm revision | Re-read current state after notifications and validate that checks and acknowledgements apply to the current relevant revision. |
-| F4 Lost concurrent updates | Protect operation transitions, participant changes and target updates transactionally. |
-| F5 Requested size reported as actual | Record backend, node and filesystem observations separately; do not release completion notifications on request acceptance alone. |
-| F6 Unbounded blocking | Propagate cancellation and errors through each worker stage; preserve progress and workload recovery obligations when execution stops. |
+| F1 Replacement presented as resize | Keep the original storage identity through expansion and restoration of access; reject stale references to replaced resources. |
+| F2 Missing ordering barrier | Gate conflicting storage and application work on persisted operation conditions. If defaults are also changed, retain an explicit ordering contract for fresh allocations. |
+| F3 Stale charm revision | Re-read current state after notifications and validate that worker checks apply to the current relevant revision. |
+| F4 Lost concurrent updates | Protect operation transitions, attachment changes and target updates transactionally. |
+| F5 Requested size reported as actual | Record backend, node and filesystem observations separately; do not report resize completion on request acceptance alone. |
+| F6 Unbounded blocking | Propagate cancellation and errors through each worker stage; preserve progress and storage recovery obligations when execution stops. |
 
-Adding a hook alone does not establish these properties. The model worker,
-machine worker, uniter and Kubernetes application provisioner must all respect
-the applicable operation conditions.
-
-One possible initial scope is growth that requires no workload interruption.
-That would defer the preparation protocol. Whether to notify the charm after
-growth, and whether notification or workload recovery must succeed before the
-operation reports completion, remain explicit design decisions. This scope
-restriction has not been selected.
+The model worker, machine worker and Kubernetes application provisioner must
+respect the applicable operation conditions. Excluding new uniter coordination
+does not remove these storage guarantees or automatically restrict resizing to
+online growth. Provider scope and supported interruption requirements remain to
+be selected within this preparation model.
 
 ## Proposed provider resize contract
 
 The existing
 [`Provider`, `VolumeSource` and `FilesystemSource` interfaces](internal/storage/interface.go#L54)
 provide a suitable extension point, including for Kubernetes. They currently
-have no resize methods. Optional interfaces would allow providers to add
+have no resize methods. An optional `Resizer` interface allows sources to add
 support without implying that every storage source can resize:
 
 ```go
-type VolumeResizer interface {
-    CheckVolumeResize(context.Context, VolumeResizeRequest) (ResizeRequirements, error)
-    EnsureVolumeSize(context.Context, VolumeResizeRequest) (ResizeProgress, error)
+type Resizer interface {
+    CheckResize(context.Context, ResizeRequest) (ResizeRequirements, error)
+    EnsureSize(context.Context, ResizeRequest) (ResizeProgress, error)
 }
 
-type FilesystemResizer interface {
-    CheckFilesystemResize(context.Context, FilesystemResizeRequest) (ResizeRequirements, error)
-    EnsureFilesystemSize(context.Context, FilesystemResizeRequest) (ResizeProgress, error)
+type ResizeRequest struct {
+    OperationID string
+    ProviderID  string
+    SizeMiB     uint64
+    Attachments []ResizeAttachment
 }
 ```
 
-These are schematic contracts, not agreed Go declarations. Requests need stable
-resource identity, target capacity and relevant attachment references. Types,
-batching, error representation and the division of node-side work remain open.
+These declarations describe the prototype contract. The selected volume or
+filesystem source determines the resource kind; `ProviderID` identifies the
+resource within that source. Requests carry stable operation identity, target
+capacity and relevant attachment references. Checks and ensure calls share the
+same contract for both kinds of source.
 The existing `Provider.Dynamic()` describes creation after machine provisioning;
 it must not be treated as a resize capability.
 
-### Meaning of the check methods
+### Meaning of the check method
 
-`CheckVolumeResize` and `CheckFilesystemResize` assess whether the particular
-resource can reach the requested size, and identify any requirements. Support
-can depend on the pool, backend, filesystem, attachment state and target size,
-even when the source implements the optional interface.
+`CheckResize` assesses whether the particular resource can reach the requested
+size, and identifies any requirements. Support can depend on the pool, backend,
+filesystem, attachment state and target size, even when the source implements
+the optional interface.
 
-The methods run in the worker phase of the asynchronous operation. A check can
+The method runs in the worker phase of the asynchronous operation. A check can
 be a normal call within its worker; the API does not wait for its execution.
 
 | Outcome | Meaning |
@@ -442,7 +851,7 @@ follow-up work needed to complete it. An already-satisfied volume check does
 not establish that its filesystem or every attached machine has observed the
 larger size. The coordinator must assess the complete storage instance.
 
-`Ensure*Size` must be idempotent, honour cancellation and handle conditions that
+`EnsureSize` must be idempotent, honour cancellation and handle conditions that
 changed after the check. It must distinguish a request accepted by the provider
 from completed growth, returning observed progress for reconciliation. Retries
 must preserve data and identity and must not repeat destructive creation work.
@@ -517,10 +926,11 @@ The domain service should persist the operation's requested target and
 generation, then approve execution after the required worker checks pass.
 Workers should execute and record the required provider and machine stages.
 Requested capacity, approved target, observed capacity and operation progress
-need distinct meanings in state. Recovery must cover both checking and resizing
-as well as any workload preparation and restoration across controller and
-machine restarts, partial completion, changed attachments, superseding requests
-and owner removal.
+need distinct meanings in state. Recovery must cover checking, resizing and
+restoration of storage access across controller and machine restarts, partial
+completion, changed attachments, superseding requests and owner removal.
+Workload preparation and recovery remain outside this reconciliation contract,
+as described above.
 
 The current storage worker skips already-provisioned
 [volumes](internal/worker/storageprovisioner/volume_events.go#L457) and
@@ -533,32 +943,31 @@ would be unsafe: that path can destroy partitions and format the filesystem.
 The proposed first scope is growth of individual existing storage instances.
 Application allocation defaults remain a separate concern. If a later command
 combines both operations, it needs an explicit ordering and partial-failure
-contract. This is a recommendation for planning, not a settled scope decision.
+contract. This is the selected prototype scope.
 
 ## Open design decisions
 
 1. Which release and storage providers should the first implementation target?
-2. Should the initial operation support growth only? Which providers can grow
-   volumes and filesystems online, and which require workload interruption?
-   Should the first implementation exclude operations needing interruption?
-3. How should users target a storage instance? If an application-wide operation
-   is offered, when is its target set fixed, and does it also change defaults?
+2. The prototype supports growth only. Which providers can grow volumes and
+   filesystems online, and which require workload interruption?
+   Which interruption requirements can be supported with out-of-band workload
+   preparation and the physical prerequisites established by storage workers?
+3. The prototype targets an individual storage ID. If an application-wide
+   operation is later offered, when is its target set fixed?
 4. What should an existing allocation below the latest application default mean
    when it is reattached or reused by a recreated unit?
-5. Which commands and API methods expose operation status, waiting and results?
-   Submission returns a durable operation identifier; how should waiting report
-   rejection, partial failure and completion, and how long are results retained?
+5. `resize-storage --wait` and `show-storage-resize` expose results. How should
+   detailed stage progress be presented, and how long should results be retained?
 6. What durable revisions or operation records order directives, new
    allocations and repeated resize requests? How are superseding requests and
    retries reconciled?
-7. What explicit charm capability and readiness contract supports preparation
-   and recovery? Which hooks and actions can run while prepared, and how do
-   shared storage and participant changes affect readiness? Is completion
-   notification required, and how does its failure affect the operation result?
+7. How should the resize command and operation result explain preparation
+   requirements and the storage conditions relevant to out-of-band workload
+   recovery? New charm hooks and uniter readiness coordination are out of scope.
 8. How should out-of-band expansion or replacement be detected and represented?
    Which observed identity changes require an explicit replacement workflow?
-9. What happens when storage or its owner is removed during expansion? What
-   state must survive model migration, backup and recovery?
+9. How will the removal ordering above be enforced for asynchronous provider
+   operations? What state must survive model migration, backup and recovery?
 10. What retry, blocked and timeout policies apply during checking and execution,
     particularly when a required machine is unavailable?
 
@@ -578,10 +987,10 @@ contract. This is a recommendation for planning, not a settled scope decision.
 | Asynchronous submission | Verify the operation is durable before its ID is returned and provider checks run through workers. Query and wait for rejection, failure and completion under that same ID. |
 | Check coordination | Hold one required worker check pending or reject it. Verify resizing cannot start and rejection leaves the desired size unchanged. Invalidate completed checks through identity, lifecycle or revision changes and verify stale results cannot authorise execution. |
 | Check contract | Exercise every outcome, inspection errors and conditions changing between check and ensure. Verify checks have no side effects and do not promise later success. |
-| Workload preparation | Hold one unit's readiness pending, omit charm support, and attempt conflicting hooks or actions. Verify disruptive work waits for valid readiness from all required consumers. |
-| Preparation recovery | Restart agents after preparation, fail expansion at each stage, and fail workload restoration. Verify prepared state and recovery obligations survive and partial growth remains visible. |
-| Participant changes | Add or remove an attachment, refresh a charm, or supersede the request after readiness is recorded. Verify stale acknowledgements cannot authorise disruption. |
-| Kubernetes pod disruption | Hold preparation pending while attempting pod replacement or conflicting scale changes. Verify required acknowledgements precede disruption and the replacement agent recovers the operation without replacing storage. |
+| Out-of-band preparation | Explicitly run a test charm's preparation action, resize and perform its documented recovery. Verify the resize workflow invokes no charm actions or new hooks and enforces observable storage prerequisites. Exercise ordinary hooks and restarts to validate the test charm's preparation procedure. |
+| Storage recovery | Fail expansion at each stage and restart workers. Verify storage progress and restoration obligations survive, partial growth remains visible, and the result supports the user's workload recovery procedure. |
+| Attachment changes | Add or remove an attachment, refresh a charm, or supersede the request after checks complete. Verify stale check results cannot authorise work on changed resources. |
+| Kubernetes pod disruption | With out-of-band preparation completed, exercise required pod replacement and conflicting scale changes. Verify durable storage coordination, preserved identity and contents, and recovery of worker progress. |
 | Multi-stage completion | Complete backend growth while holding node or filesystem growth pending. Verify the overall operation remains incomplete and resumes safely. |
 | Ephemeral storage | Grow loop and tmpfs storage while preserving contents. Verify persisted configuration and explicit rejection of unsupported rootfs or emptyDir operations. |
 | Kubernetes identity | Exercise correct and stale PVC/PV bindings, claim replacement and retained volumes without claims. Verify an old request cannot resize a different resource. |
